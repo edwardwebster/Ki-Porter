@@ -124,6 +124,7 @@ def resolve_library_uri(uri: str) -> str:
         '${KICAD9_SYMBOL_DIR}': KICAD_SYMBOLS_PATH,
         '${KICAD9_FOOTPRINT_DIR}': KICAD_FOOTPRINTS_PATH,
         '${KICAD9_3DMODEL_DIR}': KICAD_3D_PATH,
+        '${KICAD9_3D_MODEL_DIR}': KICAD_3D_PATH,
     }
 
     for token, real_path in replacements.items():
@@ -215,11 +216,46 @@ def _symbol_entry_name(entry: List[Any]) -> str:
     return str(name_token)
 
 
+def _format_atom(node: Any) -> str:
+    """! \brief Serialise an atom while preserving KiCad-friendly quoting."""
+
+    return sexpdata.dumps(node)
+
+
+def _format_sexp(node: Any, indent: int = 0) -> str:
+    """! \brief Pretty-print an S-expression using two-space indentation."""
+
+    indent_str = '  ' * indent
+
+    if isinstance(node, list):
+        if not node:
+            return f'{indent_str}()'
+
+        head = node[0]
+        if isinstance(head, list):
+            first_line = f'{indent_str}('
+            body_items = [ _format_sexp(head, indent + 1) ]
+        else:
+            first_line = f'{indent_str}({_format_atom(head)}'
+            body_items = []
+
+        for child in node[1:]:
+            body_items.append(_format_sexp(child, indent + 1))
+
+        if not body_items:
+            return f'{first_line})'
+
+        body = '\n'.join(body_items)
+        return f'{first_line}\n{body}\n{indent_str})'
+
+    return f'{indent_str}{_format_atom(node)}'
+
+
 def _merge_symbol_libraries(
     existing_ast: Optional[List[Any]],
     incoming_ast: List[Any],
-) -> Tuple[List[Any], int, int]:
-    """! \brief Merge symbol entries, returning the merged AST and stats."""
+) -> Tuple[List[Any], int]:
+    """! \brief Merge symbol entries, returning the merged AST and count."""
 
     header_in, meta_in, symbols_in = _split_symbol_library(incoming_ast)
 
@@ -228,41 +264,36 @@ def _merge_symbol_libraries(
         meta_out = list(meta_in)
         symbols_out: List[List[Any]] = []
     else:
-        header_out, meta_out, symbols_out = _split_symbol_library(existing_ast)
-        # Merge metadata by content to avoid duplicates.
-        seen_meta = {sexpdata.dumps(item) for item in meta_out}
-        for item in meta_in:
-            key = sexpdata.dumps(item)
-            if key not in seen_meta:
-                meta_out.append(item)
-                seen_meta.add(key)
+        header_existing, meta_existing, symbols_existing = _split_symbol_library(existing_ast)
+        header_out = header_existing
+        meta_out = list(meta_existing)
+        symbols_out = list(symbols_existing)
 
     name_to_index = { _symbol_entry_name(entry): idx for idx, entry in enumerate(symbols_out) }
 
     added = 0
-    updated = 0
 
     for symbol in symbols_in:
         name = _symbol_entry_name(symbol)
         if name in name_to_index:
-            symbols_out[name_to_index[name]] = symbol
-            updated += 1
-        else:
-            symbols_out.append(symbol)
-            name_to_index[name] = len(symbols_out) - 1
-            added += 1
+            raise AssertionError(
+                f"Symbol '{name}' is already present in the target library."
+            )
+        symbols_out.append(symbol)
+        name_to_index[name] = len(symbols_out) - 1
+        added += 1
 
     merged_ast: List[Any] = [header_out, *meta_out, *symbols_out]
-    return merged_ast, added, updated
+    return merged_ast, added
 
 
 def _serialise_symbol_library(ast: List[Any]) -> str:
     """! \brief Convert a symbol library AST back to text."""
 
-    text = sexpdata.dumps(ast)
-    if not text.endswith('\n'):
-        text += '\n'
-    return text
+    formatted = _format_sexp(ast)
+    if not formatted.endswith('\n'):
+        formatted += '\n'
+    return formatted
 
 
 def import_symbol_library(source_path: str, target_library: Dict[str, str]) -> str:
@@ -288,16 +319,27 @@ def import_symbol_library(source_path: str, target_library: Dict[str, str]) -> s
     incoming_ast = _load_symbol_library(source_abs)
     existing_ast = _load_symbol_library(dest_abs) if os.path.exists(dest_abs) else None
 
-    merged_ast, added, updated = _merge_symbol_libraries(existing_ast, incoming_ast)
+    _, _, incoming_symbols = _split_symbol_library(incoming_ast)
+    incoming_names = {_symbol_entry_name(symbol) for symbol in incoming_symbols}
+
+    if existing_ast is not None:
+        _, _, existing_symbols = _split_symbol_library(existing_ast)
+        existing_names = {_symbol_entry_name(symbol) for symbol in existing_symbols}
+        duplicates = sorted(existing_names.intersection(incoming_names))
+        if duplicates:
+            raise AssertionError(
+                'Symbols already present in target library: ' + ', '.join(duplicates)
+            )
+
+    merged_ast, added = _merge_symbol_libraries(existing_ast, incoming_ast)
 
     with open(dest_abs, 'w', encoding='utf-8') as handle:
         handle.write(_serialise_symbol_library(merged_ast))
 
-    added_msg = f"added {added} new" if added else "added 0 new"
-    updated_msg = f"updated {updated}" if updated else "updated 0"
+    symbol_word = 'symbol' if added == 1 else 'symbols'
     return (
-        f"Merged symbols from {os.path.basename(source_path)} into "
-        f"{target_library.get('name', 'unknown')} ({dest_abs}); {added_msg}, {updated_msg}"
+        f"Added {added} {symbol_word} from {os.path.basename(source_path)} into "
+        f"{target_library.get('name', 'unknown')} ({dest_abs})"
     )
 
 def import_to_kicad(path: str, target_library: Dict[str, str]) -> str:
@@ -313,11 +355,25 @@ def import_to_kicad(path: str, target_library: Dict[str, str]) -> str:
         destination = resolve_library_uri(uri)
         if os.path.isdir(destination):
             destination = os.path.join(destination, os.path.basename(path))
+        if os.path.exists(destination):
+            raise AssertionError(
+                f"Footprint '{os.path.basename(path)}' already exists in {library_name}."
+            )
+        if os.path.abspath(path) == os.path.abspath(destination):
+            raise AssertionError('Source and destination footprint files are identical.')
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         shutil.copy(path, destination)
         message = f"Copied footprint {os.path.basename(path)} into {library_name}"
     elif extension in {'.step', '.wrl'}:
         destination = resolve_library_uri(uri)
+        if os.path.isdir(destination):
+            destination = os.path.join(destination, os.path.basename(path))
+        if os.path.exists(destination):
+            raise AssertionError(
+                f"3D model '{os.path.basename(path)}' already exists in {library_name}."
+            )
+        if os.path.abspath(path) == os.path.abspath(destination):
+            raise AssertionError('Source and destination 3D model files are identical.')
         os.makedirs(os.path.dirname(destination), exist_ok=True)
         shutil.copy(path, destination)
         message = f"Copied 3D model {os.path.basename(path)} into {library_name}"
@@ -349,4 +405,3 @@ if __name__ == '__main__':
 
     app.run()
     sys.exit(0)
-    # TODO - Application should exit once complete
