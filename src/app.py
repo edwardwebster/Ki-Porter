@@ -11,7 +11,7 @@ keeps recent status messages visible for debugging purposes.
 import os
 import sys
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from urllib.parse import urlparse, unquote
 
@@ -95,11 +95,10 @@ def parse_lib_table(path: str) -> List[Dict[str, str]]:
 
 def load_library_tables() -> None:
     """! \brief Refresh cached KiCad library definitions from disk."""
-    global SYMBOL_LIBRARIES, FOOTPRINT_LIBRARIES
+    global SYMBOL_LIBRARIES, FOOTPRINT_LIBRARIES, MODEL_LIBRARIES
     SYMBOL_LIBRARIES = parse_lib_table(sym_lib_table)
     FOOTPRINT_LIBRARIES = parse_lib_table(footprint_lib_table)
-    # Placeholder for potential 3D model imports.
-    # MODEL_LIBRARIES remains an empty list until a catalog is defined.
+    MODEL_LIBRARIES = discover_3d_libraries()
 
 
 def get_libraries_for_type(library_type: str) -> List[Dict[str, str]]:
@@ -145,6 +144,54 @@ def resolve_library_uri(uri: str) -> str:
         resolved = os.path.abspath(resolved)
 
     return resolved
+
+
+def discover_3d_libraries() -> List[Dict[str, str]]:
+    """! \brief Enumerate available 3D model libraries based on filesystem roots."""
+
+    roots: List[str] = []
+    if KICAD_3D_PATH:
+        roots.append(KICAD_3D_PATH)
+
+    kisys3d = os.environ.get('KISYS3DMOD')
+    if kisys3d:
+        roots.extend(kisys3d.split(os.pathsep))
+
+    libraries: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    for root in roots:
+        if not root:
+            continue
+        expanded = os.path.abspath(os.path.expandvars(os.path.expanduser(root)))
+        if not os.path.isdir(expanded):
+            continue
+
+        try:
+            entries = sorted(os.listdir(expanded))
+        except OSError as exc:  # pragma: no cover - defensive
+            print(f'Unable to enumerate 3D library root {expanded}: {exc}')
+            continue
+
+        for entry in entries:
+            if not entry.endswith('.3dshapes'):
+                continue
+
+            uri = os.path.join(expanded, entry)
+            key = os.path.abspath(uri)
+            if key in seen:
+                continue
+
+            libraries.append(
+                {
+                    'name': entry[:-len('.3dshapes')],
+                    'type': 'model',
+                    'uri': uri,
+                }
+            )
+            seen.add(key)
+
+    return libraries
 
 
 def _ensure_not_system_symbol(source_path: str) -> None:
@@ -365,18 +412,30 @@ def import_to_kicad(path: str, target_library: Dict[str, str]) -> str:
         shutil.copy(path, destination)
         message = f"Copied footprint {os.path.basename(path)} into {library_name}"
     elif extension in {'.step', '.wrl'}:
-        destination = resolve_library_uri(uri)
-        if os.path.isdir(destination):
-            destination = os.path.join(destination, os.path.basename(path))
+        destination_root = resolve_library_uri(uri)
+
+        if destination_root.lower().endswith('.3dshapes'):
+            model_dir = destination_root
+        elif os.path.isdir(destination_root):
+            model_dir = os.path.join(destination_root, f"{library_name}.3dshapes")
+        else:
+            # Treat URI as a file path; place models alongside in a .3dshapes folder.
+            model_dir = os.path.join(os.path.dirname(destination_root), f"{library_name}.3dshapes")
+
+        destination = os.path.join(model_dir, os.path.basename(path))
+
         if os.path.exists(destination):
             raise AssertionError(
                 f"3D model '{os.path.basename(path)}' already exists in {library_name}."
             )
         if os.path.abspath(path) == os.path.abspath(destination):
             raise AssertionError('Source and destination 3D model files are identical.')
-        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        os.makedirs(model_dir, exist_ok=True)
         shutil.copy(path, destination)
-        message = f"Copied 3D model {os.path.basename(path)} into {library_name}"
+        message = (
+            f"Copied 3D model {os.path.basename(path)} into {library_name}"
+            f" ({model_dir})"
+        )
     else:
         message = 'Unsupported file type'
 
