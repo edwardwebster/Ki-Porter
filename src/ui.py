@@ -1,6 +1,10 @@
-import objc
+"""UI module containing the Cocoa AppDelegate and window construction."""
 
-from typing import Dict, List, Optional
+import os
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
+
+import objc
 
 from Cocoa import (
     NSApplication,
@@ -26,7 +30,6 @@ from Cocoa import (
     NSIndexSet,
     NSLineBreakByWordWrapping,
     NSViewHeightSizable,
-    NSViewMaxXMargin,
     NSViewMaxYMargin,
     NSViewMinXMargin,
     NSViewMinYMargin,
@@ -34,26 +37,41 @@ from Cocoa import (
 )
 
 
+@dataclass
+class UiContext:
+    """Immutable bundle of callbacks used by the UI layer."""
+
+    load_library_tables: Callable[[], None]
+    fetch_libraries: Callable[[str], List[Dict[str, str]]]
+    import_callback: Callable[[str, Dict[str, str]], Optional[str]]
+
+
 class AppDelegate(NSObject):
     r"""! \brief Cocoa delegate that coordinates file handling and UI state."""
 
-    def init(self):
-        r"""! \brief Initialise the delegate with empty caches and UI handles."""
+    def initWithContext_(self, context: UiContext):
+        r"""! \brief Initialise the delegate with callbacks and UI handles."""
         self = objc.super(AppDelegate, self).init()
-        
         if self is None:
             return None
 
+        if context is None:
+            raise ValueError('UiContext is required to initialise AppDelegate')
+
+        self._context = context
         self._has_finished_launching = False
         self._queued_paths: List[str] = []
         self._status_field = None
         self._status_history: List[str] = []
         self._library_table = None
         self._import_button = None
+        self._window: Optional[NSWindow] = None
         self._pending_file: Optional[str] = None
         self._pending_libraries: List[Dict[str, str]] = []
         self._pending_library_type: Optional[str] = None
-        
+
+        self._build_ui()
+
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -83,7 +101,7 @@ class AppDelegate(NSObject):
 
     def _handle_open_file(self, path: str) -> None:
         r"""! \brief Inspect the supplied file and populate UI selection state."""
-        
+        self._context.load_library_tables()
         self._update_status(f'Opened file: {path}')
         library_type = self._library_type_for_path(path)
         if library_type is None:
@@ -117,13 +135,8 @@ class AppDelegate(NSObject):
 
     def _libraries_for_type(self, library_type: str) -> List[Dict[str, str]]:
         r"""! \brief Fetch the cached libraries that match the requested type."""
-        if library_type == 'symbol':
-            return SYMBOL_LIBRARIES
-        if library_type == 'footprint':
-            return FOOTPRINT_LIBRARIES
-        if library_type == 'model':
-            return MODEL_LIBRARIES
-        return []
+        libraries = self._context.fetch_libraries(library_type)
+        return list(libraries) if libraries else []
 
     def _display_library_choices(
         self,
@@ -214,11 +227,13 @@ class AppDelegate(NSObject):
             return
 
         selection = self._pending_libraries[selected_index]
-        import_to_kicad(self._pending_file, selection)
-        self._update_status(
+        import_message = self._context.import_callback(self._pending_file, selection)
+        display_message = import_message or (
             f"Queued import for {self._pending_file} into {selection.get('name', 'unknown')}"
         )
+        self._update_status(display_message)
         self._clear_library_controls()
+        # self._schedule_termination()
 
     # NSTableView data source / delegate
     def numberOfRowsInTableView_(self, table_view):
@@ -245,6 +260,15 @@ class AppDelegate(NSObject):
                 f"Selected library '{library.get('name', 'unknown')}'"
             )
 
+    def _schedule_termination(self) -> None:
+        """! \brief Terminate the app after the status message is rendered."""
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.25, self, 'terminateApplication:', None, False
+        )
+
+    def terminateApplication_(self, timer):
+        NSApplication.sharedApplication().terminate_(self)
+
     def _schedule_process_queue(self) -> None:
         """! \brief Schedule processing for any queued file-open requests."""
         if not self._queued_paths:
@@ -261,9 +285,8 @@ class AppDelegate(NSObject):
 
     def _build_ui(self) -> None:
         """! \brief Construct the main window and all UI elements."""
-        
-        win_width = 600
-        win_height = 420
+        initial_width = 600
+        initial_height = 420
 
         mask = (
             NSTitledWindowMask
@@ -271,42 +294,97 @@ class AppDelegate(NSObject):
             | NSMiniaturizableWindowMask
             | NSResizableWindowMask
         )
+        window_rect = NSMakeRect(500, 500, initial_width, initial_height)
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(500, 500, win_width, win_height), mask, 2, False
+            window_rect, mask, 2, False
         )
-        win.setTitle_(f"Ki-Porter v{VERSION}")
-        win.setContentMinSize_((win_width, win_height))
+        win.setTitle_('Ki-Porter')
+        win.setContentMinSize_((420, 260))
+        self._window = win
 
-        library_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 140, 380, 90))
+        content_view = win.contentView()
+
+        library_scroll = NSScrollView.alloc().initWithFrame_(
+            NSMakeRect(20, 140, initial_width - 40, initial_height - 180)
+        )
         library_scroll.setHasVerticalScroller_(True)
         library_scroll.setHasHorizontalScroller_(False)
         library_scroll.setBorderType_(1)  # Bezel border
         library_scroll.setAutohidesScrollers_(True)
         library_scroll.setAutoresizingMask_(
-            NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin
+            NSViewWidthSizable | NSViewHeightSizable | NSViewMinYMargin
         )
 
         table_view = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, 380, 90))
-        table_view.setHeaderView_(None)  # hide the header row
         table_view.setAllowsMultipleSelection_(False)
         table_view.setAllowsEmptySelection_(False)
         table_view.setColumnAutoresizingStyle_(1)  # Uniform column widths
         table_view.setAutoresizesSubviews_(True)
-        table_view.setAutoresizingMask_(
-            NSViewWidthSizable | NSViewHeightSizable
-            | NSViewMinYMargin | NSViewMaxYMargin
-            | NSViewMinXMargin | NSViewMaxXMargin
+        table_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        table_view.setAllowsColumnReordering_(False)
+        table_view.setAllowsColumnResizing_(False)
+        table_view.setAllowsTypeSelect_(True)
+
+        columns = [
+            ('name', 'Name', 160.0),
+            ('type', 'Type', 80.0),
+            ('descr', 'Description', 240.0),
+        ]
+        for identifier, title, width in columns:
+            column = NSTableColumn.alloc().initWithIdentifier_(identifier)
+            column.setWidth_(width)
+            column.headerCell().setStringValue_(title)
+            column.setEditable_(False)
+            table_view.addTableColumn_(column)
+
+        table_view.setDelegate_(self)
+        table_view.setDataSource_(self)
+        table_view.reloadData()
+        self._library_table = table_view
+
+        library_scroll.setDocumentView_(table_view)
+        content_view.addSubview_(library_scroll)
+
+        button_width = 120
+        button_height = 32
+        button_margin = 20
+        import_button = NSButton.alloc().initWithFrame_(
+            NSMakeRect(
+                initial_width - button_margin - button_width,
+                button_margin,
+                button_width,
+                button_height,
+            )
         )
+        import_button.setTitle_('Import')
+        import_button.setTarget_(self)
+        import_button.setAction_('handleImportButton:')
+        import_button.setEnabled_(False)
+        import_button.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+        content_view.addSubview_(import_button)
+        self._import_button = import_button
 
-        name_column = NSTableColumn.alloc().initWithIdentifier_('name')
-        name_column.setWidth_(180)
-        name_column.headerCell().setStringValue_('Name')
-        table_view.addTableColumn_(name_column)
+        status_field = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(
+                20,
+                button_margin,
+                initial_width - (button_width + (3 * 20)),
+                80,
+            )
+        )
+        status_field.setEditable_(False)
+        status_field.setBezeled_(False)
+        status_field.setDrawsBackground_(False)
+        status_field.setUsesSingleLineMode_(False)
+        status_field.setLineBreakMode_(NSLineBreakByWordWrapping)
+        if hasattr(status_field, 'setMaximumNumberOfLines_'):
+            status_field.setMaximumNumberOfLines_(0)
+        status_field.setSelectable_(True)
+        status_field.cell().setWraps_(True)
+        status_field.cell().setScrollable_(False)
+        status_field.setStringValue_('Waiting for file...')
+        status_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+        content_view.addSubview_(status_field)
+        self._status_field = status_field
 
-        desc_column = NSTableColumn.alloc().initWithIdentifier_('desc')
-        desc_column.setWidth_(200)
-        desc_column.headerCell().setStringValue_('Description')
-        desc_column.headerCell().setLineBreakMode_(NSLineBreakByWordWrapping)
-        table_view.addTableColumn_(desc_column)
-
-        path
+        win.makeKeyAndOrderFront_(None)
