@@ -4,6 +4,7 @@ APP = ['src/app.py']
 DATA_FILES = []
 OPTIONS = {
     'argv_emulation': False,
+    'iconfile': './assets/icon.icns',
     'plist': {
         'CFBundleName': 'Ki-Porter',
         'CFBundleIdentifier': 'com.vanguard.ki-porter',

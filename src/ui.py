@@ -233,7 +233,7 @@ class AppDelegate(NSObject):
         )
         self._update_status(display_message)
         self._clear_library_controls()
-        # self._schedule_termination()
+        self._schedule_termination()
 
     # NSTableView data source / delegate
     def numberOfRowsInTableView_(self, table_view):

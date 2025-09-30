@@ -8,15 +8,23 @@ keeps recent status messages visible for debugging purposes.
 """
 
 
-import sexpdata
-
 import os
 import sys
+import shutil
+from typing import Any, Dict, List, Optional, Tuple
+
+from urllib.parse import urlparse, unquote
+
+import sexpdata
+
+from Cocoa import (
+    NSApplication,
+    NSApplicationActivateIgnoringOtherApps,
+    NSRunningApplication,
+)
 
 import utils
-
-from ui import *
-from typing import Dict, List, Optional
+from ui import AppDelegate, UiContext
 
 VERSION = "0.0.1"
 
@@ -90,130 +98,255 @@ def load_library_tables() -> None:
     global SYMBOL_LIBRARIES, FOOTPRINT_LIBRARIES
     SYMBOL_LIBRARIES = parse_lib_table(sym_lib_table)
     FOOTPRINT_LIBRARIES = parse_lib_table(footprint_lib_table)
+    # Placeholder for potential 3D model imports.
+    # MODEL_LIBRARIES remains an empty list until a catalog is defined.
 
-def import_to_kicad(path: str, target_library: Dict[str, str]):
-    r"""! \brief Placeholder import routine that reports the destination.
 
-    \param path Source file supplied by the user.
-    \param target_library Metadata describing the chosen KiCad library.
-    """
-    library_name = target_library.get('name', 'unknown')
-    print(f"Selected library '{library_name}' for {os.path.basename(path)}")
+def get_libraries_for_type(library_type: str) -> List[Dict[str, str]]:
+    """! \brief Return cached libraries matching the requested type."""
+    if library_type == 'symbol':
+        return SYMBOL_LIBRARIES
+    if library_type == 'footprint':
+        return FOOTPRINT_LIBRARIES
+    if library_type == 'model':
+        return MODEL_LIBRARIES
+    return []
 
-    if path.endswith('.kicad_sym'):
-        # dest = os.path.join(KICAD_PREFS_PATH, 'symbols', os.path.basename(file))
-        # os.makedirs(os.path.dirname(dest), exist_ok=True)
-        # os.rename(file, dest)
-        # print(f'Imported symbol to {dest}')
-        print(
-            f"Import symbol {path} into {library_name} - feature not yet implemented"
+
+def resolve_library_uri(uri: str) -> str:
+    """! \brief Expand KiCad URI tokens into an absolute filesystem path."""
+
+    if not uri:
+        raise ValueError('Target library is missing a URI entry.')
+
+    resolved = uri
+    replacements = {
+        '${KICAD9_SYMBOL_DIR}': KICAD_SYMBOLS_PATH,
+        '${KICAD9_FOOTPRINT_DIR}': KICAD_FOOTPRINTS_PATH,
+        '${KICAD9_3DMODEL_DIR}': KICAD_3D_PATH,
+    }
+
+    for token, real_path in replacements.items():
+        if real_path and token in resolved:
+            resolved = resolved.replace(token, real_path)
+
+    if resolved.startswith('file://'):
+        parsed = urlparse(resolved)
+        path = unquote(parsed.path or '')
+        if parsed.netloc and not path:
+            path = f'/{parsed.netloc}'
+        elif parsed.netloc:
+            path = f'/{parsed.netloc}{path}'
+        resolved = path
+
+    resolved = os.path.expandvars(os.path.expanduser(resolved))
+    if not os.path.isabs(resolved):
+        resolved = os.path.abspath(resolved)
+
+    return resolved
+
+
+def _ensure_not_system_symbol(source_path: str) -> None:
+    """! \brief Guard against importing from KiCad's bundled symbol directory."""
+
+    if not KICAD_SYMBOLS_PATH:
+        return
+
+    root = os.path.abspath(KICAD_SYMBOLS_PATH)
+    candidate = os.path.abspath(source_path)
+
+    try:
+        common = os.path.commonpath([candidate, root])
+    except ValueError:
+        # Paths on different drives (Windows). Safe to proceed.
+        return
+
+    if common == root:
+        raise AssertionError(
+            'Refusing to import from KiCad\'s built-in symbols directory.'
         )
-        os.system(
-            f"say 'Import symbol {os.path.basename(path)} into {library_name}'"
-        )
-    elif path.endswith('.kicad_mod'):
-        # dest = os.path.join(KICAD_PREFS_PATH, 'footprints', os.path.basename(file))
-        # os.makedirs(os.path.dirname(dest), exist_ok=True)
-        # os.rename(file, dest)
-        # print(f'Imported footprint to {dest}')
-        print(
-            f"Import footprint {path} into {library_name} - feature not yet implemented"
-        )
-        os.system(
-            f"say 'Import footprint {os.path.basename(path)} into {library_name}'"
-        )
-    elif path.endswith('.step') or path.endswith('.wrl'):
-        # dest = os.path.join(KICAD_PREFS_PATH, '3dmodels', os.path.basename(file))
-        # os.makedirs(os.path.dirname(dest), exist_ok=True)
-        # os.rename(file, dest)
-        # print(f'Imported 3D model to {dest}')
-        print(
-            f"Import 3D model {path} into {library_name} - feature not yet implemented"
-        )
-        os.system(
-            f"say 'Import 3D model {os.path.basename(path)} into {library_name}'"
-        )
+
+
+def _load_symbol_library(path: str) -> List[Any]:
+    """! \brief Parse a KiCad symbol library from disk into S-expression form."""
+
+    with open(path, 'r', encoding='utf-8') as handle:
+        return sexpdata.loads(handle.read())
+
+
+def _split_symbol_library(ast: List[Any]) -> Tuple[List[Any], List[Any], List[List[Any]]]:
+    """! \brief Separate header/metadata/symbols from a symbol library AST."""
+
+    if (
+        not isinstance(ast, list)
+        or not ast
+        or not isinstance(ast[0], sexpdata.Symbol)
+        or ast[0].value() != 'kicad_symbol_lib'
+    ):
+        raise ValueError('Invalid KiCad symbol library structure.')
+
+    header = ast[0]
+    metadata: List[Any] = []
+    symbols: List[List[Any]] = []
+
+    for node in ast[1:]:
+        if (
+            isinstance(node, list)
+            and node
+            and isinstance(node[0], sexpdata.Symbol)
+            and node[0].value() == 'symbol'
+        ):
+            symbols.append(node)
+        else:
+            metadata.append(node)
+
+    return header, metadata, symbols
+
+
+def _symbol_entry_name(entry: List[Any]) -> str:
+    """! \brief Extract the symbol name from a symbol S-expression."""
+
+    if len(entry) < 2:
+        raise ValueError('Symbol entry missing name field.')
+
+    name_token = entry[1]
+    if isinstance(name_token, sexpdata.Symbol):
+        return name_token.value()
+    return str(name_token)
+
+
+def _merge_symbol_libraries(
+    existing_ast: Optional[List[Any]],
+    incoming_ast: List[Any],
+) -> Tuple[List[Any], int, int]:
+    """! \brief Merge symbol entries, returning the merged AST and stats."""
+
+    header_in, meta_in, symbols_in = _split_symbol_library(incoming_ast)
+
+    if existing_ast is None:
+        header_out = header_in
+        meta_out = list(meta_in)
+        symbols_out: List[List[Any]] = []
     else:
-        print('Unsupported file type')
+        header_out, meta_out, symbols_out = _split_symbol_library(existing_ast)
+        # Merge metadata by content to avoid duplicates.
+        seen_meta = {sexpdata.dumps(item) for item in meta_out}
+        for item in meta_in:
+            key = sexpdata.dumps(item)
+            if key not in seen_meta:
+                meta_out.append(item)
+                seen_meta.add(key)
+
+    name_to_index = { _symbol_entry_name(entry): idx for idx, entry in enumerate(symbols_out) }
+
+    added = 0
+    updated = 0
+
+    for symbol in symbols_in:
+        name = _symbol_entry_name(symbol)
+        if name in name_to_index:
+            symbols_out[name_to_index[name]] = symbol
+            updated += 1
+        else:
+            symbols_out.append(symbol)
+            name_to_index[name] = len(symbols_out) - 1
+            added += 1
+
+    merged_ast: List[Any] = [header_out, *meta_out, *symbols_out]
+    return merged_ast, added, updated
+
+
+def _serialise_symbol_library(ast: List[Any]) -> str:
+    """! \brief Convert a symbol library AST back to text."""
+
+    text = sexpdata.dumps(ast)
+    if not text.endswith('\n'):
+        text += '\n'
+    return text
+
+
+def import_symbol_library(source_path: str, target_library: Dict[str, str]) -> str:
+    """! \brief Merge the symbols from ``source_path`` into ``target_library``."""
+
+    _ensure_not_system_symbol(source_path)
+
+    dest_uri = target_library.get('uri', '')
+    dest_path = resolve_library_uri(dest_uri)
+
+    # If the URI points to a directory, drop the incoming file inside it.
+    if os.path.isdir(dest_path):
+        dest_path = os.path.join(dest_path, os.path.basename(source_path))
+
+    source_abs = os.path.abspath(source_path)
+    dest_abs = os.path.abspath(dest_path)
+
+    if source_abs == dest_abs:
+        raise AssertionError('Source and destination symbol libraries are identical.')
+
+    os.makedirs(os.path.dirname(dest_abs), exist_ok=True)
+
+    incoming_ast = _load_symbol_library(source_abs)
+    existing_ast = _load_symbol_library(dest_abs) if os.path.exists(dest_abs) else None
+
+    merged_ast, added, updated = _merge_symbol_libraries(existing_ast, incoming_ast)
+
+    with open(dest_abs, 'w', encoding='utf-8') as handle:
+        handle.write(_serialise_symbol_library(merged_ast))
+
+    added_msg = f"added {added} new" if added else "added 0 new"
+    updated_msg = f"updated {updated}" if updated else "updated 0"
+    return (
+        f"Merged symbols from {os.path.basename(source_path)} into "
+        f"{target_library.get('name', 'unknown')} ({dest_abs}); {added_msg}, {updated_msg}"
+    )
+
+def import_to_kicad(path: str, target_library: Dict[str, str]) -> str:
+    r"""! \brief Import a KiCad asset into the selected library."""
+
+    extension = os.path.splitext(path)[1].lower()
+    library_name = target_library.get('name', 'unknown')
+    uri = target_library.get('uri', '')
+
+    if extension == '.kicad_sym':
+        message = import_symbol_library(path, target_library)
+    elif extension == '.kicad_mod':
+        destination = resolve_library_uri(uri)
+        if os.path.isdir(destination):
+            destination = os.path.join(destination, os.path.basename(path))
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.copy(path, destination)
+        message = f"Copied footprint {os.path.basename(path)} into {library_name}"
+    elif extension in {'.step', '.wrl'}:
+        destination = resolve_library_uri(uri)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.copy(path, destination)
+        message = f"Copied 3D model {os.path.basename(path)} into {library_name}"
+    else:
+        message = 'Unsupported file type'
+
+    print(message)
+    return message
 
 
 if __name__ == '__main__':
-    
+    load_library_tables()
+
     app = NSApplication.sharedApplication()
-    delegate = AppDelegate.alloc().init()
+
+    context = UiContext(
+        load_library_tables=load_library_tables,
+        fetch_libraries=get_libraries_for_type,
+        import_callback=import_to_kicad,
+    )
+
+    delegate = AppDelegate.alloc().initWithContext_(context)
     app.setDelegate_(delegate)
 
-    mask = (
-        NSTitledWindowMask
-        | NSClosableWindowMask
-        | NSMiniaturizableWindowMask
-        | NSResizableWindowMask
-    )
-    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        NSMakeRect(500, 500, 600, 420), mask, 2, False
-    )
-    win.setTitle_(f"Ki-Porter v{VERSION}")
-    win.setContentMinSize_((600, 420))
-
-    library_scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 140, 380, 90))
-    library_scroll.setHasVerticalScroller_(True)
-    library_scroll.setHasHorizontalScroller_(True)
-    library_scroll.setDrawsBackground_(False)
-    library_scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-
-    library_table = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, 380, 90))
-    library_table.setAllowsMultipleSelection_(False)
-    library_table.setUsesAlternatingRowBackgroundColors_(True)
-    library_table.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-
-    columns = [
-        ('name', 'Name', 120.0),
-        ('type', 'Type', 80.0),
-        ('uri', 'URI', 180.0),
-    ]
-    for identifier, title, width in columns:
-        column = NSTableColumn.alloc().initWithIdentifier_(identifier)
-        column.setWidth_(width)
-        column.setEditable_(False)
-        header = column.headerCell()
-        header.setStringValue_(title)
-        library_table.addTableColumn_(column)
-
-    library_table.setDelegate_(delegate)
-    library_table.setDataSource_(delegate)
-    library_table.reloadData()
-
-    library_scroll.setDocumentView_(library_table)
-    win.contentView().addSubview_(library_scroll)
-
-    import_button = NSButton.alloc().initWithFrame_(NSMakeRect(300, 110, 100, 26))
-    import_button.setTitle_('Import')
-    import_button.setTarget_(delegate)
-    import_button.setAction_('handleImportButton:')
-    import_button.setEnabled_(False)
-    import_button.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
-    win.contentView().addSubview_(import_button)
-
-    status_field = NSTextField.alloc().initWithFrame_(NSMakeRect(20, 20, 380, 80))
-    status_field.setEditable_(False)
-    status_field.setBezeled_(False)
-    status_field.setDrawsBackground_(False)
-    status_field.setUsesSingleLineMode_(False)
-    status_field.setLineBreakMode_(NSLineBreakByWordWrapping)
-    status_field.setSelectable_(True)
-    status_field.cell().setWraps_(True)
-    status_field.cell().setScrollable_(True)
-    status_field.setStringValue_('Waiting for file...')
-    status_field.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
-    win.contentView().addSubview_(status_field)
-
-    delegate.setStatusField_(status_field)
-    delegate.setLibraryTable_(library_table)
-    delegate.setImportButton_(import_button)
-    win.makeKeyAndOrderFront_(None)
-
     # bring to front when launched by double-click
-    NSRunningApplication.currentApplication().activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    NSRunningApplication.currentApplication().activateWithOptions_(
+        NSApplicationActivateIgnoringOtherApps
+    )
 
     app.run()
     sys.exit(0)
+    # TODO - Application should exit once complete
